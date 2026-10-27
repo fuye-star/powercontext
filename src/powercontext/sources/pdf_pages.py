@@ -1,4 +1,4 @@
-﻿# Copyright (c) 2026 OceanBase.
+# Copyright (c) 2026 OceanBase.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -285,7 +285,7 @@ async def _rank_captured_pages(
 
     try:
         page = await memory.list()
-    except (AttributeError, TypeError):
+    except Exception:  # noqa: BLE001 - a host without entry listing falls back to search
         return ()
     records = getattr(page, "entries", ())
     if not records:
@@ -297,7 +297,10 @@ async def _rank_captured_pages(
     key = (reference.family, reference.artifact_id, reference.revision)
     index = _INDEX_CACHE.get(key)
     if index is None:
-        index = _build_page_index(records, MemoryCitation)
+        try:
+            index = _build_page_index(records, MemoryCitation)
+        except Exception:  # noqa: BLE001 - never fail the search because an index build broke
+            index = None
         if index is None:
             return ()
         _INDEX_CACHE[key] = index
