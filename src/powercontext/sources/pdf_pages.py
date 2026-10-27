@@ -18,7 +18,9 @@ from __future__ import annotations
 
 import hashlib
 import io
+import math
 import re
+from collections import Counter
 from typing import TYPE_CHECKING
 from urllib.parse import quote
 
@@ -177,6 +179,114 @@ async def search_pdf_pages(
 
     if limit < 1:
         raise ValueError("limit must be a positive integer")  # noqa: TRY003
+    terms = _question_terms(question)
+    if not terms:
+        raise ValueError("question must contain searchable terms")  # noqa: TRY003
+    ranked = await _rank_captured_pages(memory, terms, limit)
+    if ranked:
+        return ranked
+    return await _search_with_memory(memory, question, limit)
+
+
+async def _rank_captured_pages(
+    memory: ScopedMemory,
+    terms: tuple[str, ...],
+    limit: int,
+) -> tuple[MemoryCitation, ...]:
+    """Rank the captured page corpus directly so no admissible page is missed."""
+
+    from powercontext.builtin.artifacts.memory.models import MemoryCitation
+
+    try:
+        page = await memory.list()
+    except (AttributeError, TypeError):
+        return ()
+    records = getattr(page, "entries", ())
+    if not records:
+        return ()
+
+    documents: list[tuple[MemoryCitation, str, str]] = []
+    for record in records:
+        entry = record.entry
+        if not entry.sources:
+            continue
+        citation = MemoryCitation(
+            memory_ref=record.memory_ref,
+            entry_id=entry.entry_id,
+            entry_version_id=entry.entry_version_id,
+        )
+        documents.append((citation, entry.sources[0].source_id, entry.text))
+    if not documents:
+        return ()
+
+    scores = _bm25_scores([text for _citation, _source, text in documents], terms)
+    order = sorted(range(len(documents)), key=lambda index: (-scores[index], index))
+    selected: list[MemoryCitation] = []
+    seen: set[str] = set()
+    for index in order:
+        citation, source_id, _text = documents[index]
+        if source_id in seen:
+            continue
+        seen.add(source_id)
+        selected.append(citation)
+        if len(selected) >= min(limit, len(documents)):
+            break
+    return tuple(selected)
+
+
+def _question_terms(question: str) -> tuple[str, ...]:
+    tokens = [token.casefold() for token in _TOKEN.findall(question)]
+    keywords = [token for token in tokens if token not in _QUERY_STOPWORDS]
+    selected = keywords or tokens
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for token in selected:
+        if token not in seen:
+            seen.add(token)
+            ordered.append(token)
+    return tuple(ordered)
+
+
+_WORD = re.compile(r"[a-z0-9]+")
+
+
+def _bm25_scores(texts: list[str], terms: tuple[str, ...]) -> list[float]:
+    tokenized = [_WORD.findall(text.casefold()) for text in texts]
+    count = len(tokenized)
+    average = sum(len(document) for document in tokenized) / count if count else 1.0
+    document_frequency: Counter[str] = Counter()
+    for document in tokenized:
+        document_frequency.update(set(document))
+    idf = {
+        term: math.log(1 + (count - document_frequency[term] + 0.5) / (document_frequency[term] + 0.5))
+        for term in terms
+        if document_frequency.get(term)
+    }
+    k1, b = 1.2, 0.75
+    scores: list[float] = []
+    for document in tokenized:
+        frequencies = Counter(document)
+        length = len(document)
+        score = 0.0
+        for term in terms:
+            if term not in idf:
+                continue
+            frequency = frequencies.get(term, 0)
+            if frequency:
+                score += idf[term] * frequency * (k1 + 1) / (
+                    frequency + k1 * (1 - b + b * length / average)
+                )
+        scores.append(score)
+    return scores
+
+
+async def _search_with_memory(
+    memory: ScopedMemory,
+    question: str,
+    limit: int,
+) -> tuple[MemoryCitation, ...]:
+    """Fall back to Memory search for hosts that do not expose captured entries."""
+
     from powercontext.builtin.artifacts.memory.models import MemoryCitation
     from powercontext.builtin.runtime import GetMemoryEntryRequest, SearchMemoryRequest
 
