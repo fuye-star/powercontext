@@ -1,4 +1,4 @@
-# Copyright (c) 2026 OceanBase.
+﻿# Copyright (c) 2026 OceanBase.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -226,6 +226,54 @@ async def search_pdf_pages(
     return await _search_with_memory(memory, question, limit)
 
 
+class _PageIndex:
+    """Cached lexical index over one Memory revision of captured PDF pages."""
+
+    __slots__ = (
+        "body_avg",
+        "body_df",
+        "body_len",
+        "body_tf",
+        "citations",
+        "source_ids",
+        "titles",
+        "window_avg",
+        "window_count",
+        "window_df",
+        "windows",
+    )
+
+    def __init__(
+        self,
+        *,
+        citations: tuple[MemoryCitation, ...],
+        source_ids: tuple[str, ...],
+        titles: tuple[str, ...],
+        body_tf: tuple[Counter[str], ...],
+        body_len: tuple[int, ...],
+        body_df: Counter[str],
+        body_avg: float,
+        windows: tuple[tuple[tuple[Counter[str], int], ...], ...],
+        window_df: Counter[str],
+        window_avg: float,
+        window_count: int,
+    ) -> None:
+        self.citations = citations
+        self.source_ids = source_ids
+        self.titles = titles
+        self.body_tf = body_tf
+        self.body_len = body_len
+        self.body_df = body_df
+        self.body_avg = body_avg
+        self.windows = windows
+        self.window_df = window_df
+        self.window_avg = window_avg
+        self.window_count = window_count
+
+
+_INDEX_CACHE: dict[tuple[str, str, int], _PageIndex] = {}
+
+
 async def _rank_captured_pages(
     memory: ScopedMemory,
     terms: tuple[str, ...],
@@ -242,34 +290,170 @@ async def _rank_captured_pages(
     records = getattr(page, "entries", ())
     if not records:
         return ()
-
-    documents: list[tuple[MemoryCitation, str, str]] = []
-    for record in records:
-        entry = record.entry
-        if not entry.sources:
-            continue
-        citation = MemoryCitation(
-            memory_ref=record.memory_ref,
-            entry_id=entry.entry_id,
-            entry_version_id=entry.entry_version_id,
-        )
-        documents.append((citation, entry.sources[0].source_id, _page_body(entry.text)))
-    if not documents:
+    reference = getattr(page, "memory_ref", None)
+    if reference is None:
         return ()
 
-    scores = _combined_bm25_scores([text for _citation, _source, text in documents], terms)
-    order = sorted(range(len(documents)), key=lambda index: (-scores[index], index))
+    key = (reference.family, reference.artifact_id, reference.revision)
+    index = _INDEX_CACHE.get(key)
+    if index is None:
+        index = _build_page_index(records, MemoryCitation)
+        if index is None:
+            return ()
+        _INDEX_CACHE[key] = index
+        while len(_INDEX_CACHE) > 4:
+            _INDEX_CACHE.pop(next(iter(_INDEX_CACHE)))
+
+    scores = _index_scores(index, terms)
+    order = sorted(range(len(index.source_ids)), key=lambda position: (-scores[position], position))
     selected: list[MemoryCitation] = []
     seen: set[str] = set()
-    for index in order:
-        citation, source_id, _text = documents[index]
+    for position in order:
+        source_id = index.source_ids[position]
         if source_id in seen:
             continue
         seen.add(source_id)
-        selected.append(citation)
-        if len(selected) >= min(limit, len(documents)):
+        selected.append(index.citations[position])
+        if len(selected) >= min(limit, len(index.source_ids)):
             break
     return tuple(selected)
+
+
+def _build_page_index(records: object, citation_type: type) -> _PageIndex | None:
+    citations: list[MemoryCitation] = []
+    source_ids: list[str] = []
+    titles: list[str] = []
+    body_tf: list[Counter[str]] = []
+    body_len: list[int] = []
+    body_df: Counter[str] = Counter()
+    windows: list[tuple[tuple[Counter[str], int], ...]] = []
+    window_df: Counter[str] = Counter()
+    window_total = 0
+    window_count = 0
+    body_total = 0
+
+    for record in records:  # type: ignore[union-attr]
+        entry = record.entry
+        if not entry.sources:
+            continue
+        body = _page_body(entry.text)
+        tokens = _document_tokens(body)
+        counts = Counter(tokens)
+        citations.append(
+            citation_type(
+                memory_ref=record.memory_ref,
+                entry_id=entry.entry_id,
+                entry_version_id=entry.entry_version_id,
+            )
+        )
+        source_ids.append(entry.sources[0].source_id)
+        lines = [line.strip() for line in body.splitlines() if line.strip()]
+        titles.append(" ".join(lines[:3]).upper())
+        body_tf.append(counts)
+        body_len.append(len(tokens))
+        body_df.update(set(tokens))
+        body_total += len(tokens)
+
+        page_windows: list[tuple[Counter[str], int]] = []
+        for position in range(len(lines)):
+            chunk = _document_tokens(" ".join(lines[position : position + 2]))
+            if not chunk:
+                continue
+            chunk_counts = Counter(chunk)
+            page_windows.append((chunk_counts, len(chunk)))
+            window_df.update(set(chunk))
+            window_total += len(chunk)
+            window_count += 1
+        windows.append(tuple(page_windows))
+
+    if not citations:
+        return None
+    return _PageIndex(
+        citations=tuple(citations),
+        source_ids=tuple(source_ids),
+        titles=tuple(titles),
+        body_tf=tuple(body_tf),
+        body_len=tuple(body_len),
+        body_df=body_df,
+        body_avg=body_total / len(body_len) if body_len else 1.0,
+        windows=tuple(windows),
+        window_df=window_df,
+        window_avg=window_total / window_count if window_count else 1.0,
+        window_count=window_count,
+    )
+
+
+def _index_scores(index: _PageIndex, terms: tuple[str, ...]) -> list[float]:
+    k1, b = _BM25_K1, _BM25_B
+    count = len(index.source_ids)
+    body_idf = {
+        term: math.log(1 + (count - index.body_df[term] + 0.5) / (index.body_df[term] + 0.5))
+        for term in terms
+        if index.body_df.get(term)
+    }
+    window_idf = {
+        term: math.log(1 + (index.window_count - index.window_df[term] + 0.5) / (index.window_df[term] + 0.5))
+        for term in terms
+        if index.window_df.get(term)
+    }
+    term_set = set(terms)
+    wanted: set[str] = set()
+    if term_set & _BALANCE_SHEET_TERMS:
+        wanted.add("balance")
+    if term_set & _INCOME_TERMS:
+        wanted.add("income")
+    if term_set & _CASH_FLOW_TERMS:
+        wanted.add("cash")
+
+    scores: list[float] = []
+    for position in range(count):
+        frequencies = index.body_tf[position]
+        length = index.body_len[position] or 1
+        score = 0.0
+        for term in terms:
+            frequency = frequencies.get(term)
+            if frequency:
+                idf = body_idf.get(term)
+                if idf:
+                    score += idf * frequency * (k1 + 1) / (
+                        frequency + k1 * (1 - b + b * length / index.body_avg)
+                    )
+
+        best_window = 0.0
+        for window_counts, window_length in index.windows[position]:
+            window_score = 0.0
+            for term in terms:
+                frequency = window_counts.get(term)
+                if frequency:
+                    idf = window_idf.get(term)
+                    if idf:
+                        window_score += idf * frequency * (k1 + 1) / (
+                            frequency + k1 * (1 - b + b * window_length / index.window_avg)
+                        )
+            if window_score > best_window:
+                best_window = window_score
+        combined = score + _WINDOW_WEIGHT * best_window
+
+        title = index.titles[position]
+        boost = 0.0
+        if wanted:
+            if "balance" in wanted and "BALANCE SHEET" in title:
+                boost = _SECTION_BOOST
+            elif "income" in wanted and (
+                "STATEMENTS OF INCOME" in title
+                or "INCOME STATEMENTS" in title
+                or "STATEMENTS OF OPERATIONS" in title
+            ):
+                boost = _SECTION_BOOST
+            elif "cash" in wanted and "CASH FLOW" in title:
+                boost = _SECTION_BOOST
+        for name, keywords in _SECTION_TERMS.items():
+            if boost >= _SECTION_BOOST:
+                break
+            if term_set & keywords and name in title:
+                boost = _SECTION_BOOST
+        scores.append(combined * (1 + boost))
+    return scores
 
 
 def _question_terms(question: str) -> tuple[str, ...]:
@@ -286,7 +470,85 @@ def _question_terms(question: str) -> tuple[str, ...]:
 
 
 _WORD = re.compile(r"[a-z0-9]+")
-_HEADING_BOOST = 3.0
+_BM25_K1 = 0.9
+_BM25_B = 0.75
+_WINDOW_WEIGHT = 2.0
+_SECTION_BOOST = 2.0
+
+_BALANCE_SHEET_TERMS = frozenset(
+    {
+        "asset",
+        "assets",
+        "balance",
+        "capital",
+        "card",
+        "current",
+        "debt",
+        "deposit",
+        "deposits",
+        "equity",
+        "inventories",
+        "inventory",
+        "liabilities",
+        "liability",
+        "liquidity",
+        "member",
+        "members",
+        "quick",
+        "ratio",
+        "receivable",
+        "receivables",
+        "working",
+    }
+)
+_INCOME_TERMS = frozenset(
+    {
+        "cost",
+        "costs",
+        "earnings",
+        "ebitda",
+        "eps",
+        "expense",
+        "expenses",
+        "gross",
+        "income",
+        "margin",
+        "operating",
+        "profit",
+        "rate",
+        "revenue",
+        "revenues",
+        "sales",
+        "tax",
+    }
+)
+_CASH_FLOW_TERMS = frozenset(
+    {
+        "amortization",
+        "buyback",
+        "capex",
+        "cash",
+        "depreciation",
+        "dividend",
+        "dividends",
+        "expenditure",
+        "expenditures",
+        "financing",
+        "flow",
+        "flows",
+        "investing",
+        "repurchase",
+    }
+)
+_SECTION_TERMS: dict[str, frozenset[str]] = {
+    "LEGAL PROCEEDINGS": frozenset({"battles", "lawsuit", "lawsuits", "legal", "litigation", "proceedings"}),
+    "GEOGRAPHIC": frozenset({"countries", "geographic", "geographies", "geography", "regions"}),
+    "CONCENTRATION": frozenset({"concentration", "concentrated"}),
+    "INCOME TAXES": frozenset({"tax", "taxation", "taxes"}),
+    "PROPERTIES": frozenset({"facilities", "plants", "properties", "property"}),
+    "HUMAN CAPITAL": frozenset({"employee", "employees", "headcount", "workforce"}),
+    "SEGMENT": frozenset({"segment", "segments"}),
+}
 
 
 def _page_body(text: str) -> str:
@@ -296,58 +558,12 @@ def _page_body(text: str) -> str:
     return body if separator else text
 
 
-def _heading_text(text: str) -> str:
-    """Keep short lines, which carry the financial-statement section headings."""
-
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    return " ".join(line for line in lines if len(line.split()) <= 8)
-
-
 def _document_tokens(text: str) -> list[str]:
     return [
         token
         for token in _WORD.findall(text.casefold())
         if token not in _QUERY_STOPWORDS and (len(token) > 1 or token.isdigit())
     ]
-
-
-def _combined_bm25_scores(texts: list[str], terms: tuple[str, ...]) -> list[float]:
-    bodies = [_document_tokens(text) for text in texts]
-    headings = [_document_tokens(_heading_text(text)) for text in texts]
-    body_scores = _bm25_scores(bodies, terms)
-    heading_scores = _bm25_scores(headings, terms)
-    return [
-        body + _HEADING_BOOST * heading for body, heading in zip(body_scores, heading_scores, strict=True)
-    ]
-
-
-def _bm25_scores(tokenized: list[list[str]], terms: tuple[str, ...]) -> list[float]:
-    count = len(tokenized)
-    average = sum(len(document) for document in tokenized) / count if count else 1.0
-    document_frequency: Counter[str] = Counter()
-    for document in tokenized:
-        document_frequency.update(set(document))
-    idf = {
-        term: math.log(1 + (count - document_frequency[term] + 0.5) / (document_frequency[term] + 0.5))
-        for term in terms
-        if document_frequency.get(term)
-    }
-    k1, b = 1.2, 0.75
-    scores: list[float] = []
-    for document in tokenized:
-        frequencies = Counter(document)
-        length = len(document)
-        score = 0.0
-        for term in terms:
-            if term not in idf:
-                continue
-            frequency = frequencies.get(term, 0)
-            if frequency:
-                score += idf[term] * frequency * (k1 + 1) / (
-                    frequency + k1 * (1 - b + b * length / average)
-                )
-        scores.append(score)
-    return scores
 
 
 async def _search_with_memory(
