@@ -116,9 +116,11 @@ def pdf_page_source_id(document_id: str, document_sha256: str, page_number: int)
     """Build the stable identity of one page in one document revision."""
 
     source_id = f"pdf:{quote(document_id, safe='')}:{document_sha256}:{page_number}"
-    if len(source_id) > MAX_SOURCE_ID_LENGTH:
-        raise ValueError(f"PDF page source id must not exceed {MAX_SOURCE_ID_LENGTH} characters")  # noqa: TRY003
-    return source_id
+    if len(source_id) <= MAX_SOURCE_ID_LENGTH:
+        return source_id
+    # Keep the identity bounded and collision-resistant for long document ids.
+    digest = hashlib.sha256(document_id.encode("utf-8")).hexdigest()[:32]
+    return f"pdf:{digest}:{document_sha256}:{page_number}"
 
 
 def parse_pdf_document(value: PDFDocumentInput, /) -> tuple[PDFPageInput, ...]:
@@ -227,7 +229,27 @@ def _query_variants(question: str) -> tuple[tuple[str, float], ...]:
         core_query = " ".join(core)
         if core_query not in {query for query, _weight in variants}:
             variants.append((core_query, 0.5))
+    # Single-term probes satisfy the admission floor trivially, so pages that share only
+    # part of the question still enter the fusion instead of being filtered out.
+    for token in _term_queries(keywords or tokens):
+        if token.casefold() in {query.casefold() for query, _weight in variants}:
+            continue
+        variants.append((token, 0.3))
     return tuple(variants)
+
+
+def _term_queries(tokens: list[str]) -> list[str]:
+    """Pick the few most distinctive single terms for low-floor probes."""
+
+    candidates = {
+        token for token in tokens if len(token) >= 3 and token.casefold() not in _QUERY_STOPWORDS
+    }
+    ranked = sorted(
+        candidates,
+        key=lambda token: (any(character.isdigit() for character in token), len(token)),
+        reverse=True,
+    )
+    return ranked[:6]
 
 
 def _core_terms(tokens: list[str]) -> list[str]:
