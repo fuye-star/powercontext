@@ -17,6 +17,9 @@
 from __future__ import annotations
 
 import json
+import math
+import re
+from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from itertools import chain
@@ -106,6 +109,7 @@ class PreparedContextBuild:
     origins: tuple[PreparedContextOrigin, ...]
     omissions: PreparedContextOmissions = PreparedContextOmissions()
     code_origins: tuple[CodeEvidenceRef, ...] = ()
+    fragments: tuple[EvidenceFragment, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -118,6 +122,16 @@ class MemoryEntryAddress:
 
 
 PreparedContextOrigin = MemoryCitation | ArtifactRef | MemoryEntryAddress | ArtifactAddress
+
+
+@dataclass(frozen=True)
+class EvidenceFragment:
+    """One literal span of a Memory entry selected as query-relevant evidence."""
+
+    address: MemoryEntryAddress
+    start: int
+    end: int
+    text: str
 
 
 @dataclass(frozen=True)
@@ -227,6 +241,23 @@ class PreparedContextBuilder:
                 )
 
             return assemble_code(request, code_candidates, self.entry_limit, historical)
+
+        if request.evidence_selection:
+            content, origins, fragments, omissions = self._select_fragments(
+                request=request,
+                memory_candidates=memory_candidates,
+            )
+            if content is None:
+                return PreparedContextBuild(context=self.empty(), origins=(), omissions=omissions)
+            content_bytes = len(content.encode("utf-8"))
+            if content_bytes > request.max_bytes:
+                raise PreparedContextInvariantError("output-budget")
+            return PreparedContextBuild(
+                context=PreparedContext(status="ready", content=content, content_bytes=content_bytes),
+                origins=origins,
+                omissions=omissions,
+                fragments=fragments,
+            )
 
         if sum(len(candidates.hits) for candidates in memory_candidates) > self.memory_candidate_limit:
             raise PreparedContextInvariantError("memory-candidate-limit")
@@ -432,6 +463,77 @@ class PreparedContextBuilder:
             return None, (), omissions
         content = render_context_text(included, assembly)
         return content, tuple(origins), omissions
+
+    def _select_fragments(
+        self,
+        *,
+        request: PrepareContextRequest,
+        memory_candidates: Sequence[PreparedMemoryCandidates],
+    ) -> tuple[str | None, tuple[PreparedContextOrigin, ...], tuple[EvidenceFragment, ...], PreparedContextOmissions]:
+        """Select literal query-relevant spans from Memory candidates within the byte budget."""
+
+        groups = [group for group in memory_candidates if group.hits]
+        if not groups:
+            return None, (), (), PreparedContextOmissions()
+        query_terms = set(_fragment_terms(request.query))
+        documents: list[tuple[PreparedMemoryCandidates, MemoryHit, tuple[tuple[int, int, list[str]], ...]]] = []
+        document_frequency: Counter[str] = Counter()
+        for group in groups:
+            if group.memory_ref is None:
+                raise PreparedContextInvariantError("memory-ref-missing")
+            for hit in group.hits:
+                spans: list[tuple[int, int, list[str]]] = []
+                for start, end in _sentence_spans(hit.text):
+                    terms = _fragment_terms(hit.text[start:end])
+                    if not terms:
+                        continue
+                    spans.append((start, end, terms))
+                    for term in set(terms):
+                        document_frequency[term] += 1
+                documents.append((group, hit, tuple(spans)))
+
+        total = max(len(documents), 1)
+        ranked: list[tuple[float, int, int, int, PreparedMemoryCandidates, MemoryHit]] = []
+        for order, (group, hit, spans) in enumerate(documents):
+            for start, end, terms in spans:
+                score = 0.0
+                for term in set(terms):
+                    if term not in query_terms:
+                        continue
+                    idf = math.log(1 + (total + 1) / (document_frequency.get(term, 0) + 0.5))
+                    score += idf * terms.count(term)
+                if score > 0:
+                    ranked.append((-score, order, start, end, group, hit))
+        ranked.sort(key=lambda item: (item[0], item[1], item[2]))
+
+        selected: list[EvidenceFragment] = []
+        seen: set[tuple[str, str, int, int]] = set()
+        for _negative, _order, start, end, group, hit in ranked:
+            key = (hit.entry_id, hit.entry_version_id, start, end)
+            if key in seen:
+                continue
+            fragment = EvidenceFragment(
+                address=MemoryEntryAddress(
+                    memory=ArtifactAddress(scope_id=group.scope_id, artifact=hit.memory_ref),
+                    entry_id=hit.entry_id,
+                    entry_version_id=hit.entry_version_id,
+                ),
+                start=start,
+                end=end,
+                text=hit.text[start:end],
+            )
+            if len(_render_fragments((*selected, fragment)).encode("utf-8")) > request.max_bytes:
+                continue
+            seen.add(key)
+            selected.append(fragment)
+        if not selected:
+            return None, (), (), PreparedContextOmissions()
+        return (
+            _render_fragments(selected),
+            tuple(fragment.address for fragment in selected),
+            tuple(selected),
+            PreparedContextOmissions(),
+        )
 
     def _profile_entries(self, candidates: Sequence[PreparedProfileCandidate]) -> tuple[_PreparedContextEntry, ...]:
         entries = []
@@ -683,6 +785,50 @@ def _interleave_groups(groups: Sequence[Sequence[_Item]]) -> tuple[_Item, ...]:
     for index in range(max((len(group) for group in groups), default=0)):
         ordered.extend(group[index] for group in groups if index < len(group))
     return tuple(ordered)
+
+
+_SENTENCE_BREAK = re.compile(r"(?<=[.!?])\s+|\n\s*\n")
+_FRAGMENT_WORD = re.compile(r"[a-z]+|\d+")
+
+
+def _sentence_spans(text: str) -> tuple[tuple[int, int], ...]:
+    spans: list[tuple[int, int]] = []
+    start = 0
+    for match in _SENTENCE_BREAK.finditer(text):
+        end = match.start()
+        if end > start:
+            spans.append((start, end))
+        start = match.end()
+    if start < len(text):
+        spans.append((start, len(text)))
+    return tuple(spans)
+
+
+def _fragment_terms(text: str) -> list[str]:
+    return _FRAGMENT_WORD.findall(text.lower())
+
+
+def _render_fragments(fragments: Sequence[EvidenceFragment]) -> str:
+    items = []
+    for fragment in fragments:
+        address = fragment.address
+        items.append(
+            {
+                "citation": {
+                    "scope_id": address.memory.scope_id,
+                    "memory_ref": address.memory.artifact.model_dump(mode="json"),
+                    "entry_id": address.entry_id,
+                    "entry_version_id": address.entry_version_id,
+                },
+                "content": fragment.text,
+                "start": fragment.start,
+                "end": fragment.end,
+                "truncated": False,
+            }
+        )
+    envelope = {"trust": "untrusted_history", "items": items}
+    encoded = json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))
+    return "\n\n".join((TRUST_POLICY, f"{_BEGIN_MARKER}\n{encoded}\n{_END_MARKER}"))
 
 
 def _render(entries: Sequence[_PreparedContextEntry]) -> str:
