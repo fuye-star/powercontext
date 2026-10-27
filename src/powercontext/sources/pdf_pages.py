@@ -83,6 +83,44 @@ _QUERY_STOPWORDS = frozenset(
         "why",
         "will",
         "with",
+        # Instruction and framing words that FinanceBench questions add around the
+        # actual request; they carry no evidence-page signal.
+        "all",
+        "also",
+        "analyst",
+        "answer",
+        "any",
+        "assume",
+        "assuming",
+        "calculate",
+        "can",
+        "compute",
+        "could",
+        "define",
+        "detail",
+        "details",
+        "explicitly",
+        "give",
+        "if",
+        "investment",
+        "may",
+        "not",
+        "only",
+        "perspective",
+        "question",
+        "rely",
+        "relying",
+        "respond",
+        "response",
+        "should",
+        "show",
+        "shown",
+        "state",
+        "use",
+        "used",
+        "using",
+        "within",
+        "would",
     }
 )
 _TOKEN = re.compile(r"[A-Za-z]+|\d+(?:[.,]\d+)*")
@@ -215,11 +253,11 @@ async def _rank_captured_pages(
             entry_id=entry.entry_id,
             entry_version_id=entry.entry_version_id,
         )
-        documents.append((citation, entry.sources[0].source_id, entry.text))
+        documents.append((citation, entry.sources[0].source_id, _page_body(entry.text)))
     if not documents:
         return ()
 
-    scores = _bm25_scores([text for _citation, _source, text in documents], terms)
+    scores = _combined_bm25_scores([text for _citation, _source, text in documents], terms)
     order = sorted(range(len(documents)), key=lambda index: (-scores[index], index))
     selected: list[MemoryCitation] = []
     seen: set[str] = set()
@@ -235,7 +273,7 @@ async def _rank_captured_pages(
 
 
 def _question_terms(question: str) -> tuple[str, ...]:
-    tokens = [token.casefold() for token in _TOKEN.findall(question)]
+    tokens = [token for token in _WORD.findall(question.casefold()) if len(token) > 1 or token.isdigit()]
     keywords = [token for token in tokens if token not in _QUERY_STOPWORDS]
     selected = keywords or tokens
     seen: set[str] = set()
@@ -248,10 +286,42 @@ def _question_terms(question: str) -> tuple[str, ...]:
 
 
 _WORD = re.compile(r"[a-z0-9]+")
+_HEADING_BOOST = 3.0
 
 
-def _bm25_scores(texts: list[str], terms: tuple[str, ...]) -> list[float]:
-    tokenized = [_WORD.findall(text.casefold()) for text in texts]
+def _page_body(text: str) -> str:
+    """Drop the document-id line that the text-evidence projection prepends."""
+
+    _document_id, separator, body = text.partition("\n")
+    return body if separator else text
+
+
+def _heading_text(text: str) -> str:
+    """Keep short lines, which carry the financial-statement section headings."""
+
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    return " ".join(line for line in lines if len(line.split()) <= 8)
+
+
+def _document_tokens(text: str) -> list[str]:
+    return [
+        token
+        for token in _WORD.findall(text.casefold())
+        if token not in _QUERY_STOPWORDS and (len(token) > 1 or token.isdigit())
+    ]
+
+
+def _combined_bm25_scores(texts: list[str], terms: tuple[str, ...]) -> list[float]:
+    bodies = [_document_tokens(text) for text in texts]
+    headings = [_document_tokens(_heading_text(text)) for text in texts]
+    body_scores = _bm25_scores(bodies, terms)
+    heading_scores = _bm25_scores(headings, terms)
+    return [
+        body + _HEADING_BOOST * heading for body, heading in zip(body_scores, heading_scores, strict=True)
+    ]
+
+
+def _bm25_scores(tokenized: list[list[str]], terms: tuple[str, ...]) -> list[float]:
     count = len(tokenized)
     average = sum(len(document) for document in tokenized) / count if count else 1.0
     document_frequency: Counter[str] = Counter()
