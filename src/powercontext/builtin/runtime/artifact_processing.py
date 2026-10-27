@@ -406,6 +406,7 @@ class _FamilyState:
     scan_after: int = 0
     scan_generation: int = 0
     scan_in_progress: bool = False
+    scan_time_due: bool = False
     reconcile_after: str | None = None
     reconcile_complete: bool = False
     notification_at_start: int = 0
@@ -737,20 +738,30 @@ class ArtifactProcessingSupervisor:
                     await self._binding_states.finish_scan(connection, binding.binding_name)
                 next_schedule_at = None
                 scan_after = 0
+                state.scan_time_due = False
             else:
                 now = await database_utc_now(connection)
                 if persisted is None or not persisted.scan_in_progress:
                     checkpoint = None if persisted is None else persisted.last_schedule_checkpoint_at
                     due, next_time = _schedule_deadline(binding, checkpoint, now)
+                    scan_checkpoint = due
+                    time_due = due is not None
                     if binding.source_count_threshold is not None:
                         # Count admission polls the journal while keeping the time condition as an OR.
-                        if due is None:
-                            due = now
+                        # A polling scan must not advance the interval checkpoint, otherwise the
+                        # time condition could never become due.
                         poll = now + timedelta(seconds=_COUNT_TRIGGER_POLL_SECONDS)
                         next_time = min(next_time, poll)
+                        if due is None:
+                            due = now
+                            scan_checkpoint = checkpoint
+                            time_due = False
                     next_schedule_at = asyncio.get_running_loop().time() + max(0, (next_time - now).total_seconds())
                     if due is not None:
-                        persisted = await self._binding_states.start_scan(connection, binding.binding_name, due)
+                        persisted = await self._binding_states.start_scan(
+                            connection, binding.binding_name, scan_checkpoint
+                        )
+                        state.scan_time_due = time_due
                         scan_after = 0
                 if persisted is not None and persisted.scan_in_progress:
                     scan_in_progress = True
@@ -776,15 +787,13 @@ class ArtifactProcessingSupervisor:
                     eligible = frozenset(candidates)
                     if candidates and binding.automatic_scope_filter is not None:
                         eligible &= await binding.automatic_scope_filter(connection, candidates)
-                    if eligible and binding.source_count_threshold is not None:
-                        time_due, _next = _schedule_deadline(binding, persisted.last_schedule_checkpoint_at, now)
-                        if time_due is None:
-                            qualified = set()
-                            for scope_id in eligible:
-                                pending = await self._pending_count(connection, scope_id, binding.binding_name)
-                                if pending >= binding.source_count_threshold:
-                                    qualified.add(scope_id)
-                            eligible &= frozenset(qualified)
+                    if eligible and binding.source_count_threshold is not None and not state.scan_time_due:
+                        qualified = set()
+                        for scope_id in eligible:
+                            pending = await self._pending_count(connection, scope_id, binding.binding_name)
+                            if pending >= binding.source_count_threshold:
+                                qualified.add(scope_id)
+                        eligible &= frozenset(qualified)
                     for row in rows:
                         # A full page of ineligible rows still advances discovery;
                         # keep their dirty Source and request counters untouched.
@@ -798,6 +807,7 @@ class ArtifactProcessingSupervisor:
                     scan_in_progress = len(rows) == min(capacity, _DISCOVERY_PAGE_SIZE)
                     if not scan_in_progress:
                         await self._binding_states.finish_scan(connection, binding.binding_name)
+                        state.scan_time_due = False
                         scan_after = 0
                         # Starting a scan established its checkpoint, so a
                         # completed page must not restart the interval here.
