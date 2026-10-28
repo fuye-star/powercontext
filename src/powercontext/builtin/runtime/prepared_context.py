@@ -525,6 +525,23 @@ class PreparedContextBuilder:
                 if float(score) > 0:
                     ranked.append((-float(score), order, int(start), int(end), group, hit))
         ranked.sort(key=lambda item: (item[0], item[1], item[2]))
+        ceiling = max((float(-item[0]) for item in ranked), default=0.0)
+        if ceiling:
+            # A claim may be supported by more than one abstract: lead with the best
+            # sentence of every genuinely competitive document, then fall back to score order.
+            best_by_document: dict[int, float] = {}
+            for item in ranked:
+                best_by_document[item[1]] = max(best_by_document.get(item[1], 0.0), -item[0])
+            seeds = [
+                item
+                for order in best_by_document
+                if best_by_document[order] >= _DOCUMENT_SEED_SHARE * ceiling
+                for item in ranked
+                if item[1] == order
+            ][: len(best_by_document)]
+            if len(seeds) > 1:
+                seed_ids = {id(item) for item in seeds}
+                ranked = seeds + [item for item in ranked if id(item) not in seed_ids]
 
         selected: list[EvidenceFragment] = []
         texts: dict[tuple[str, str, int, str, str], str] = {}
@@ -546,7 +563,7 @@ class PreparedContextBuilder:
                 EvidenceFragment(address=address, start=start, end=end, text=hit.text[start:end]),
                 texts,
             )
-            if len(_render_fragments(trial).encode("utf-8")) > request.max_bytes:
+            if len(_render_fragments(trial).encode("utf-8")) > int(request.max_bytes * _GREEDY_BUDGET_SHARE):
                 continue
             seen.add(key)
             selected = trial
@@ -848,6 +865,8 @@ def _interleave_groups(groups: Sequence[Sequence[_Item]]) -> tuple[_Item, ...]:
 
 
 _NEIGHBOUR_SENTENCE_WEIGHT = 0.6
+_GREEDY_BUDGET_SHARE = 1.0
+_DOCUMENT_SEED_SHARE = 0.8
 _SENTENCE_BREAK = re.compile(r"(?<=[.!?])\s+|\n\s*\n")
 _FRAGMENT_WORD = re.compile(r"[a-z]+|\d+")
 
