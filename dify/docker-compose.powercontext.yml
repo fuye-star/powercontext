@@ -1,0 +1,24 @@
+# 把这段服务合并进 Dify 的 docker/docker-compose.yaml，
+# 或者在本目录单独 `docker compose -f docker-compose.powercontext.yml up -d`。
+#
+# 合并进 Dify compose 时：
+#   - Dify 的 api / worker 容器可以用服务名访问：http://powercontext:8123
+#   - Dify 应用环境变量 PC_BASE_URL 填 http://powercontext:8123
+services:
+  powercontext:
+    build:
+      context: .
+      dockerfile: Dockerfile.powercontext
+    image: memory-inn-powercontext:1.0
+    container_name: memory-inn-powercontext
+    restart: unless-stopped
+    environment:
+      POWERCONTEXT_SERVER_ALLOW_UNAUTHENTICATED_NON_LOOPBACK: "true"
+      POWERCONTEXT_SERVER_DATABASE: '{"kind":"sqlite","url":"sqlite+aiosqlite:////data/inn.db"}'
+    volumes:
+      - powercontext-data:/data
+    ports:
+      - "8123:8123"
+
+volumes:
+  powercontext-data:

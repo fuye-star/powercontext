@@ -1,0 +1,23 @@
+# Memory Inn PowerContext Server
+#
+# Build:
+#   docker build -f Dockerfile.powercontext -t memory-inn-powercontext:1.0 .
+# Run:
+#   docker run --rm -p 8123:8123 -v powercontext-data:/data memory-inn-powercontext:1.0
+FROM python:3.12-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git curl \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip install --no-cache-dir \
+    "powercontext[server] @ git+https://github.com/fuye-star/powercontext@2026-competition"
+
+ENV POWERCONTEXT_SERVER_ALLOW_UNAUTHENTICATED_NON_LOOPBACK=true \
+    POWERCONTEXT_SERVER_DATABASE={"kind":"sqlite","url":"sqlite+aiosqlite:////data/inn.db"} \
+    PYTHONUNBUFFERED=1
+
+VOLUME ["/data"]
+EXPOSE 8123
+
+CMD ["powercontext", "server", "run", "--host", "0.0.0.0", "--port", "8123", "--no-env-file"]
