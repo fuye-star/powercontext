@@ -22,7 +22,7 @@ import math
 import re
 from collections import Counter
 from typing import TYPE_CHECKING
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 
 from pydantic import BaseModel
 from pypdf import PdfReader
@@ -220,7 +220,7 @@ async def search_pdf_pages(
     terms = _question_terms(question)
     if not terms:
         raise ValueError("question must contain searchable terms")  # noqa: TRY003
-    ranked = await _rank_captured_pages(memory, terms, limit)
+    ranked = await _rank_captured_pages(memory, question, terms, limit)
     if ranked:
         return ranked
     return await _search_with_memory(memory, question, limit)
@@ -235,6 +235,7 @@ class _PageIndex:
         "body_len",
         "body_tf",
         "citations",
+        "documents",
         "pages",
         "source_ids",
         "titles",
@@ -249,6 +250,7 @@ class _PageIndex:
         *,
         citations: tuple[MemoryCitation, ...],
         source_ids: tuple[str, ...],
+        documents: tuple[str, ...],
         pages: tuple[int, ...],
         titles: tuple[str, ...],
         body_tf: tuple[Counter[str], ...],
@@ -262,6 +264,7 @@ class _PageIndex:
     ) -> None:
         self.citations = citations
         self.source_ids = source_ids
+        self.documents = documents
         self.pages = pages
         self.titles = titles
         self.body_tf = body_tf
@@ -279,6 +282,7 @@ _INDEX_CACHE: dict[tuple[str, str, int], _PageIndex] = {}
 
 async def _rank_captured_pages(
     memory: ScopedMemory,
+    question: str,
     terms: tuple[str, ...],
     limit: int,
 ) -> tuple[MemoryCitation, ...]:
@@ -312,21 +316,16 @@ async def _rank_captured_pages(
         while len(_INDEX_CACHE) > 4:
             _INDEX_CACHE.pop(next(iter(_INDEX_CACHE)))
 
-    scores = _index_scores(index, terms)
-    # Evidence often continues across a physical page break, so a page inherits part of
-    # the strength of its immediate neighbours without displacing the strongest pages.
-    by_page = {page: position for position, page in enumerate(index.pages)}
-    ranked_scores = list(scores)
-    for position, page in enumerate(index.pages):
-        inherited = 0.0
-        for radius, weight in _NEIGHBOUR_WEIGHTS:
-            for neighbour_page in (page - radius, page + radius):
-                neighbour = by_page.get(neighbour_page)
-                if neighbour is not None:
-                    inherited = max(inherited, scores[neighbour] * weight)
-        if inherited > 0:
-            ranked_scores[position] += inherited
-    order = sorted(range(len(index.source_ids)), key=lambda position: (-ranked_scores[position], position))
+    targeted = _question_documents(index, question)
+    if targeted:
+        # One Memory can hold several filings. Rank the named company's pages with their
+        # own document statistics, otherwise another filing's term collisions win.
+        positions = [position for position in range(len(index.source_ids)) if index.documents[position] in targeted]
+        if positions:
+            subset = _subset_index(index, positions)
+            order = _ordered_positions(subset, terms)
+            return tuple(subset.citations[position] for position in order[: min(limit, len(order))])
+    order = _ordered_positions(index, terms)
     selected: list[MemoryCitation] = []
     seen: set[str] = set()
     cap = min(limit, len(index.source_ids))
@@ -341,9 +340,66 @@ async def _rank_captured_pages(
     return tuple(selected)
 
 
+def _ordered_positions(index: _PageIndex, terms: tuple[str, ...]) -> list[int]:
+    scores = _index_scores(index, terms)
+    # Evidence often continues across a physical page break, so a page inherits part of
+    # the strength of its immediate neighbours without displacing the strongest pages.
+    by_key = {
+        (index.documents[position], index.pages[position]): position for position in range(len(index.source_ids))
+    }
+    ranked = list(scores)
+    for position, page in enumerate(index.pages):
+        document = index.documents[position]
+        inherited = 0.0
+        for radius, weight in _NEIGHBOUR_WEIGHTS:
+            for neighbour_page in (page - radius, page + radius):
+                neighbour = by_key.get((document, neighbour_page))
+                if neighbour is not None:
+                    inherited = max(inherited, scores[neighbour] * weight)
+        if inherited > 0:
+            ranked[position] += inherited
+    return sorted(range(len(index.source_ids)), key=lambda position: (-ranked[position], position))
+
+
+def _subset_index(index: _PageIndex, positions: list[int]) -> _PageIndex:
+    """Recompute index statistics over one document so per-document BM25 matches."""
+
+    body_tf = tuple(index.body_tf[position] for position in positions)
+    body_len = tuple(index.body_len[position] for position in positions)
+    body_df: Counter[str] = Counter()
+    for counts in body_tf:
+        body_df.update(counts.keys())
+    windows = tuple(index.windows[position] for position in positions)
+    window_df: Counter[str] = Counter()
+    window_total = 0
+    window_count = 0
+    for page_windows in windows:
+        for counts, length in page_windows:
+            window_df.update(counts.keys())
+            window_total += length
+            window_count += 1
+    body_total = sum(body_len)
+    return _PageIndex(
+        citations=tuple(index.citations[position] for position in positions),
+        source_ids=tuple(index.source_ids[position] for position in positions),
+        documents=tuple(index.documents[position] for position in positions),
+        pages=tuple(index.pages[position] for position in positions),
+        titles=tuple(index.titles[position] for position in positions),
+        body_tf=body_tf,
+        body_len=body_len,
+        body_df=body_df,
+        body_avg=body_total / len(body_len) if body_len else 1.0,
+        windows=windows,
+        window_df=window_df,
+        window_avg=window_total / window_count if window_count else 1.0,
+        window_count=window_count,
+    )
+
+
 def _build_page_index(records: object, citation_type: type) -> _PageIndex | None:
     citations: list[MemoryCitation] = []
     source_ids: list[str] = []
+    documents: list[str] = []
     pages: list[int] = []
     titles: list[str] = []
     body_tf: list[Counter[str]] = []
@@ -371,10 +427,9 @@ def _build_page_index(records: object, citation_type: type) -> _PageIndex | None
         )
         source_id = entry.sources[0].source_id
         source_ids.append(source_id)
-        try:
-            pages.append(int(source_id.rsplit(":", 1)[-1]))
-        except ValueError:
-            pages.append(len(pages) + 1)
+        document_id, page_number = _source_document(source_id)
+        documents.append(_document_alias(document_id))
+        pages.append(page_number if page_number is not None else len(pages) + 1)
         lines = [line.strip() for line in body.splitlines() if line.strip()]
         titles.append(" ".join(lines[:3]).upper())
         body_tf.append(counts)
@@ -399,6 +454,7 @@ def _build_page_index(records: object, citation_type: type) -> _PageIndex | None
     return _PageIndex(
         citations=tuple(citations),
         source_ids=tuple(source_ids),
+        documents=tuple(documents),
         pages=tuple(pages),
         titles=tuple(titles),
         body_tf=tuple(body_tf),
@@ -637,6 +693,42 @@ _SECTION_TERMS: dict[str, frozenset[str]] = {
     "HUMAN CAPITAL": frozenset({"employee", "employees", "headcount", "workforce"}),
     "SEGMENT": frozenset({"segment", "segments"}),
 }
+
+
+_DOCUMENT_STOPWORDS = frozenset({"10k", "10q", "8k", "earnings", "dated"})
+
+
+def _source_document(source_id: str) -> tuple[str, int | None]:
+    """Return the document id and physical page encoded in a page Source id."""
+
+    parts = source_id.split(":")
+    if len(parts) < 4 or parts[0] != "pdf":
+        return "", None
+    document_id = unquote(parts[1])
+    try:
+        return document_id, int(parts[-1])
+    except ValueError:
+        return document_id, None
+
+
+def _document_alias(document_id: str) -> str:
+    """Collapse a document id into the name the question would mention."""
+
+    words = []
+    for part in re.split(r"[^a-z0-9]+", document_id.casefold()):
+        if not part or part.isdigit() or part in _DOCUMENT_STOPWORDS:
+            continue
+        if part[0].isdigit() and len(part) > 2:
+            continue
+        words.append(part)
+    return "".join(words)
+
+
+def _question_documents(index: _PageIndex, question: str) -> frozenset[str]:
+    normalized = re.sub(r"[^a-z0-9]", "", question.casefold())
+    if not normalized:
+        return frozenset()
+    return frozenset(alias for alias in set(index.documents) if len(alias) >= 2 and alias in normalized)
 
 
 def _page_body(text: str) -> str:
