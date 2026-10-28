@@ -493,8 +493,9 @@ class PreparedContextBuilder:
                 documents.append((group, hit, tuple(spans)))
 
         total = max(len(documents), 1)
-        ranked: list[tuple[float, int, int, int, PreparedMemoryCandidates, MemoryHit]] = []
-        for order, (group, hit, spans) in enumerate(documents):
+        scored_documents: list[tuple[PreparedMemoryCandidates, MemoryHit, list[list[object]]]] = []
+        for group, hit, spans in documents:
+            scored: list[list[object]] = []
             for start, end, terms in spans:
                 score = 0.0
                 for term in set(terms):
@@ -502,30 +503,53 @@ class PreparedContextBuilder:
                         continue
                     idf = math.log(1 + (total + 1) / (document_frequency.get(term, 0) + 0.5))
                     score += idf * terms.count(term)
-                if score > 0:
-                    ranked.append((-score, order, start, end, group, hit))
+                scored.append([start, end, score])
+            scored_documents.append((group, hit, scored))
+
+        # Evidence often spans consecutive sentences, so a sentence inherits part of a
+        # strong neighbour's score and adjacent selections merge into one literal span.
+        for _group, _hit, scored in scored_documents:
+            base = [float(item[2]) for item in scored]
+            for index, item in enumerate(scored):
+                neighbour = 0.0
+                if index:
+                    neighbour = max(neighbour, base[index - 1])
+                if index + 1 < len(base):
+                    neighbour = max(neighbour, base[index + 1])
+                if neighbour:
+                    item[2] = float(item[2]) + _NEIGHBOUR_SENTENCE_WEIGHT * neighbour
+
+        ranked: list[tuple[float, int, int, int, PreparedMemoryCandidates, MemoryHit]] = []
+        for order, (group, hit, scored) in enumerate(scored_documents):
+            for start, end, score in scored:
+                if float(score) > 0:
+                    ranked.append((-float(score), order, int(start), int(end), group, hit))
         ranked.sort(key=lambda item: (item[0], item[1], item[2]))
 
         selected: list[EvidenceFragment] = []
+        texts: dict[tuple[str, str, int, str, str], str] = {}
         seen: set[tuple[str, str, int, int]] = set()
         for _negative, _order, start, end, group, hit in ranked:
             key = (hit.entry_id, hit.entry_version_id, start, end)
             if key in seen:
                 continue
-            fragment = EvidenceFragment(
-                address=MemoryEntryAddress(
-                    memory=ArtifactAddress(scope_id=group.scope_id, artifact=hit.memory_ref),
-                    entry_id=hit.entry_id,
-                    entry_version_id=hit.entry_version_id,
-                ),
-                start=start,
-                end=end,
-                text=hit.text[start:end],
+            address = MemoryEntryAddress(
+                memory=ArtifactAddress(scope_id=group.scope_id, artifact=hit.memory_ref),
+                entry_id=hit.entry_id,
+                entry_version_id=hit.entry_version_id,
             )
-            if len(_render_fragments((*selected, fragment)).encode("utf-8")) > request.max_bytes:
+            identity = _fragment_identity(address)
+            texts.setdefault(identity, hit.text)
+            trial = list(selected)
+            _merge_fragment(
+                trial,
+                EvidenceFragment(address=address, start=start, end=end, text=hit.text[start:end]),
+                texts,
+            )
+            if len(_render_fragments(trial).encode("utf-8")) > request.max_bytes:
                 continue
             seen.add(key)
-            selected.append(fragment)
+            selected = trial
         if not selected:
             return None, (), (), PreparedContextOmissions()
         return (
@@ -787,6 +811,7 @@ def _interleave_groups(groups: Sequence[Sequence[_Item]]) -> tuple[_Item, ...]:
     return tuple(ordered)
 
 
+_NEIGHBOUR_SENTENCE_WEIGHT = 0.6
 _SENTENCE_BREAK = re.compile(r"(?<=[.!?])\s+|\n\s*\n")
 _FRAGMENT_WORD = re.compile(r"[a-z]+|\d+")
 
@@ -806,6 +831,34 @@ def _sentence_spans(text: str) -> tuple[tuple[int, int], ...]:
 
 def _fragment_terms(text: str) -> list[str]:
     return _FRAGMENT_WORD.findall(text.lower())
+
+
+def _fragment_identity(address: MemoryEntryAddress) -> tuple[str, str, int, str, str]:
+    return (
+        address.memory.scope_id,
+        address.memory.artifact.artifact_id,
+        address.memory.artifact.revision,
+        address.entry_id,
+        address.entry_version_id,
+    )
+
+
+def _merge_fragment(
+    fragments: list[EvidenceFragment],
+    fragment: EvidenceFragment,
+    texts: dict[tuple[str, str, int, str, str], str],
+) -> None:
+    identity = _fragment_identity(fragment.address)
+    for index, existing in enumerate(fragments):
+        if _fragment_identity(existing.address) != identity:
+            continue
+        if fragment.start <= existing.end + 1 and existing.start <= fragment.end + 1:
+            text = texts.get(identity, existing.text)
+            start = min(existing.start, fragment.start)
+            end = max(existing.end, fragment.end)
+            fragments[index] = EvidenceFragment(address=existing.address, start=start, end=end, text=text[start:end])
+            return
+    fragments.append(fragment)
 
 
 def _render_fragments(fragments: Sequence[EvidenceFragment]) -> str:
