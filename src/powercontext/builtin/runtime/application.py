@@ -2687,6 +2687,15 @@ class ScopedTopicMemoryApplication:
                     query_embedding,
                     embedding_timeout_seconds,
                 )
+        unavailable = await self._runtime.lifecycle.for_scope(self.scope_id).unavailable_topics()
+        if unavailable:
+            result = result.model_copy(
+                update={
+                    "hits": tuple(
+                        hit for hit in result.hits if hit.artifact_ref.artifact_id not in unavailable
+                    )
+                }
+            )
         observer = self._runtime._topic_memory_search_observer
         if observer is not None:
             try:
@@ -2989,6 +2998,18 @@ def _log_scheduled_processing(
     )
 
 
+class SourceLifecycleApplication:
+    """Resolve the Source lifecycle service for one Scope."""
+
+    def __init__(self, runtime: BuiltinRuntime) -> None:
+        self._runtime = runtime
+
+    def for_scope(self, scope_id: str) -> object:
+        from powercontext.builtin.runtime.source_lifecycle import ScopedSourceLifecycle
+
+        return ScopedSourceLifecycle(self._runtime, validate_scope_id(scope_id))
+
+
 class BuiltinRuntime:
     """Add business-specific operations over composed built-in contexts."""
 
@@ -3047,6 +3068,7 @@ class BuiltinRuntime:
         remote_ingestion: RemoteIngestion | None = None,
         dream_service: DreamService | None = None,
         generation_concurrency: int = 4,
+        lifecycle_database: object | None = None,
     ) -> None:
         if source_window_limit < 1:
             raise _RuntimeConfigurationError("source_window_limit")
@@ -3113,6 +3135,8 @@ class BuiltinRuntime:
         self._processor_lock = asyncio.Lock()
         self._close_lock = asyncio.Lock()
         self._lifecycle = asyncio.Condition()
+        self._lifecycle_database = lifecycle_database
+        self.lifecycle = SourceLifecycleApplication(self)
         self._active_operations = 0
         self._operation_depths: dict[asyncio.Task[Any], int] = {}
         self._closing = False
