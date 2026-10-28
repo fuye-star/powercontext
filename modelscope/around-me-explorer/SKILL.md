@@ -99,3 +99,5 @@ maps_direction_walking(origin="120.21,30.29", destination="<候选经纬度>")
 | Manner Coffee（东站西广场店） | 浙江省杭州市上城区… | 540 米 | 约 8 分钟 | 步行 8 分钟，仍在 10 分钟范围内 |
 
 说明：起点由“杭州东站”解析得到（120.21,30.29），搜索半径 800 米；营业状态与排队情况未核实。
+
+<!-- OB-S:5QIYa8keZwZukOBjpAR4MA -->
