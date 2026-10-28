@@ -550,6 +550,42 @@ class PreparedContextBuilder:
                 continue
             seen.add(key)
             selected = trial
+
+        # Spend any leftover budget completing adjacent sentences of the selected spans.
+        spans_by_entry = {
+            (hit.entry_id, hit.entry_version_id): (group, hit, scored)
+            for group, hit, scored in scored_documents
+        }
+        for _round in range(3):
+            grew = False
+            for fragment in list(selected):
+                key = (fragment.address.entry_id, fragment.address.entry_version_id)
+                entry = spans_by_entry.get(key)
+                if entry is None:
+                    continue
+                group, hit, scored = entry
+                identity = _fragment_identity(fragment.address)
+                texts.setdefault(identity, hit.text)
+                for start, end, _score in scored:
+                    trial = list(selected)
+                    _merge_fragment(
+                        trial,
+                        EvidenceFragment(
+                            address=fragment.address,
+                            start=int(start),
+                            end=int(end),
+                            text=hit.text[int(start) : int(end)],
+                        ),
+                        texts,
+                    )
+                    if sum(item.end - item.start for item in trial) <= sum(item.end - item.start for item in selected):
+                        continue
+                    if len(_render_fragments(trial).encode("utf-8")) > request.max_bytes:
+                        continue
+                    selected = trial
+                    grew = True
+            if not grew:
+                break
         if not selected:
             return None, (), (), PreparedContextOmissions()
         return (
@@ -876,7 +912,6 @@ def _render_fragments(fragments: Sequence[EvidenceFragment]) -> str:
                 "content": fragment.text,
                 "start": fragment.start,
                 "end": fragment.end,
-                "truncated": False,
             }
         )
     envelope = {"trust": "untrusted_history", "items": items}
