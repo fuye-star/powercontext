@@ -22,6 +22,7 @@
 | `python -m coach stats alice` | 查看记忆画像（正确率、薄弱主题、最近查询） | PowerContext 读取记忆（新进程） |
 | `python -m coach quiz alice` | 按薄弱主题出填空题 | 记忆 + seekdb 取题 |
 | `python -m coach notes` | 查看库里的笔记与主题分布 | seekdb 查询 |
+| `python -m coach export alice` | 导出画像 JSON（薄弱主题、正确率、最近查询） | PowerContext 读取 |
 
 ## 运行说明
 

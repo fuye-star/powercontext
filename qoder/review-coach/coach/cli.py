@@ -123,6 +123,24 @@ def cmd_review(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_export(args: argparse.Namespace) -> int:
+    memory = Memory(MEMORY_DB)
+    profile = memory.profile(args.user)
+    print(
+        json.dumps(
+            {
+                "user": args.user,
+                "weak_topics": [item["topic"] for item in profile["weak_topics"]],
+                "accuracy": profile["accuracy"],
+                "recent_queries": profile["recent_queries"],
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+    return 0
+
+
 def cmd_stats(args: argparse.Namespace) -> int:
     store = NoteStore()
     memory = Memory(MEMORY_DB)
@@ -161,6 +179,10 @@ def main(argv: list[str] | None = None) -> int:
     stats = sub.add_parser("stats", help="show the memory profile after a restart")
     stats.add_argument("user")
     stats.set_defaults(func=cmd_stats)
+
+    export = sub.add_parser("export", help="export user profile as JSON")
+    export.add_argument("user")
+    export.set_defaults(func=cmd_export)
 
     args = parser.parse_args(argv)
     return int(args.func(args) or 0)
