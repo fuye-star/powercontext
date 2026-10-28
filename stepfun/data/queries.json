@@ -1,0 +1,9 @@
+[
+  { "query": "哪种数据库可以直接在网页里做向量和全文混合检索", "relevant": "doc-seekdb" },
+  { "query": "同义词和模糊语义的搜索应该用什么方式", "relevant": "doc-hybrid" },
+  { "query": "384 维向量的模型是哪一个", "relevant": "doc-embedding" },
+  { "query": "浏览器不支持 WebGPU 时怎么推理", "relevant": "doc-webgpu" },
+  { "query": "INT8 量化能把模型压缩多少", "relevant": "doc-quant" },
+  { "query": "端侧推理对隐私有什么好处", "relevant": "doc-browser-ai" },
+  { "query": "RRF 是怎么融合两路检索结果的", "relevant": "doc-rrf" }
+]

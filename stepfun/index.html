@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>阶跃知识库 · 端侧向量化 + seekdb 混合检索</title>
+    <link rel="stylesheet" href="/src/style.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <span class="logo">seekdb</span>
+        <div>
+          <h1>端侧知识库</h1>
+          <p>浏览器本地向量化 · seekdb 混合检索</p>
+        </div>
+      </div>
+      <div class="badges">
+        <span id="backend-badge" class="badge badge-wait">后端检测中…</span>
+        <span id="dtype-badge" class="badge">精度 —</span>
+        <span id="model-badge" class="badge">模型加载中…</span>
+      </div>
+    </header>
+
+    <main class="layout">
+      <section class="panel">
+        <h2>1. 导入语料</h2>
+        <p class="hint">支持纯文本 / Markdown / JSON（[{id,title,text}]）。向量在浏览器本地计算，只把向量和文本写入 seekdb。</p>
+        <div class="row">
+          <input id="file-input" type="file" accept=".txt,.md,.json" />
+          <button id="sample-button" class="ghost">载入示例语料</button>
+          <button id="reset-button" class="ghost danger">清空知识库</button>
+        </div>
+        <textarea id="corpus-input" rows="8" placeholder="每篇文档用一行 --- 分隔，第一行作为标题…"></textarea>
+        <div class="row">
+          <label class="field">
+            批大小
+            <input id="batch-size" type="number" min="1" max="64" value="8" />
+          </label>
+          <button id="import-button" class="primary">本地向量化并写入 seekdb</button>
+        </div>
+        <div class="progress"><div id="import-progress" class="bar"></div></div>
+        <pre id="import-log" class="log"></pre>
+      </section>
+
+      <section class="panel">
+        <h2>2. 混合检索</h2>
+        <p class="hint">查询向量在本地生成；向量召回与全文召回都在 seekdb 内完成并融合排序。</p>
+        <div class="row">
+          <input id="query-input" type="text" placeholder="例如：浏览器不支持 WebGPU 怎么办" />
+          <button id="search-button" class="primary">检索</button>
+        </div>
+        <div id="timing" class="timing">等待检索…</div>
+        <ol id="results" class="results"></ol>
+        <div id="documents" class="documents"></div>
+      </section>
+    </main>
+
+    <footer class="footer">
+      <span>模型：Xenova/all-MiniLM-L6-v2（384 维）</span>
+      <span>推理：Transformers.js + ONNX Runtime Web</span>
+      <span>存储：seekdb（向量 + 全文索引）</span>
+      <a id="size-link" href="/data/model-sizes.json" target="_blank" rel="noreferrer">模型体积与量化对比</a>
+    </footer>
+
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>
