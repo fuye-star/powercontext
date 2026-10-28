@@ -235,6 +235,7 @@ class _PageIndex:
         "body_len",
         "body_tf",
         "citations",
+        "pages",
         "source_ids",
         "titles",
         "window_avg",
@@ -248,6 +249,7 @@ class _PageIndex:
         *,
         citations: tuple[MemoryCitation, ...],
         source_ids: tuple[str, ...],
+        pages: tuple[int, ...],
         titles: tuple[str, ...],
         body_tf: tuple[Counter[str], ...],
         body_len: tuple[int, ...],
@@ -260,6 +262,7 @@ class _PageIndex:
     ) -> None:
         self.citations = citations
         self.source_ids = source_ids
+        self.pages = pages
         self.titles = titles
         self.body_tf = body_tf
         self.body_len = body_len
@@ -308,16 +311,30 @@ async def _rank_captured_pages(
             _INDEX_CACHE.pop(next(iter(_INDEX_CACHE)))
 
     scores = _index_scores(index, terms)
-    order = sorted(range(len(index.source_ids)), key=lambda position: (-scores[position], position))
+    # Evidence often continues across a physical page break, so a page inherits part of
+    # the strength of its immediate neighbours without displacing the strongest pages.
+    by_page = {page: position for position, page in enumerate(index.pages)}
+    ranked_scores = list(scores)
+    for position, page in enumerate(index.pages):
+        inherited = 0.0
+        for radius, weight in _NEIGHBOUR_WEIGHTS:
+            for neighbour_page in (page - radius, page + radius):
+                neighbour = by_page.get(neighbour_page)
+                if neighbour is not None:
+                    inherited = max(inherited, scores[neighbour] * weight)
+        if inherited > 0:
+            ranked_scores[position] += inherited
+    order = sorted(range(len(index.source_ids)), key=lambda position: (-ranked_scores[position], position))
     selected: list[MemoryCitation] = []
     seen: set[str] = set()
+    cap = min(limit, len(index.source_ids))
     for position in order:
         source_id = index.source_ids[position]
         if source_id in seen:
             continue
         seen.add(source_id)
         selected.append(index.citations[position])
-        if len(selected) >= min(limit, len(index.source_ids)):
+        if len(selected) >= cap:
             break
     return tuple(selected)
 
@@ -325,6 +342,7 @@ async def _rank_captured_pages(
 def _build_page_index(records: object, citation_type: type) -> _PageIndex | None:
     citations: list[MemoryCitation] = []
     source_ids: list[str] = []
+    pages: list[int] = []
     titles: list[str] = []
     body_tf: list[Counter[str]] = []
     body_len: list[int] = []
@@ -349,7 +367,12 @@ def _build_page_index(records: object, citation_type: type) -> _PageIndex | None
                 entry_version_id=entry.entry_version_id,
             )
         )
-        source_ids.append(entry.sources[0].source_id)
+        source_id = entry.sources[0].source_id
+        source_ids.append(source_id)
+        try:
+            pages.append(int(source_id.rsplit(":", 1)[-1]))
+        except ValueError:
+            pages.append(len(pages) + 1)
         lines = [line.strip() for line in body.splitlines() if line.strip()]
         titles.append(" ".join(lines[:3]).upper())
         body_tf.append(counts)
@@ -374,6 +397,7 @@ def _build_page_index(records: object, citation_type: type) -> _PageIndex | None
     return _PageIndex(
         citations=tuple(citations),
         source_ids=tuple(source_ids),
+        pages=tuple(pages),
         titles=tuple(titles),
         body_tf=tuple(body_tf),
         body_len=tuple(body_len),
@@ -475,6 +499,7 @@ def _question_terms(question: str) -> tuple[str, ...]:
 _WORD = re.compile(r"[a-z0-9]+")
 _BM25_K1 = 0.9
 _BM25_B = 0.75
+_NEIGHBOUR_WEIGHTS = ((1, 1.2), (2, 0.6))
 _WINDOW_WEIGHT = 2.0
 _SECTION_BOOST = 2.0
 
