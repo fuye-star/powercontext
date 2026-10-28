@@ -108,8 +108,9 @@ qoder/review-coach/
 
 ## Qoder 开发与发布
 
-- 开发记录：见 `QODER_LOG.md`，按模板补充 Qoder 会话截图、生成的关键文件与 Qoder 账号 UID；
-- 项目网站：`site/` 为静态站点源码，在 Qoder 中通过 **Sites** 创建站点并发布，可见范围设为「任何人都可访问」。
+- 开发记录：见 `QODER_LOG.md`，包含 Qoder 会话记录、生成的关键文件与 Qoder 账号 UID；
+- 项目网站：`site/` 为静态站点源码，已通过 **Qoder Sites** 发布为公开站点：
+  <https://review-coach-vrpg39olhg9.qoder.zone>（`access_mode=public`，未登录可访问）。
 
 ## 说明
 
