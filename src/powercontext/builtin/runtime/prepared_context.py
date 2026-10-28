@@ -485,8 +485,6 @@ class PreparedContextBuilder:
                 spans: list[tuple[int, int, list[str]]] = []
                 for start, end in _sentence_spans(hit.text):
                     terms = _fragment_terms(hit.text[start:end])
-                    if not terms:
-                        continue
                     spans.append((start, end, terms))
                     for term in set(terms):
                         document_frequency[term] += 1
@@ -521,9 +519,14 @@ class PreparedContextBuilder:
 
         ranked: list[tuple[float, int, int, int, PreparedMemoryCandidates, MemoryHit]] = []
         for order, (group, hit, scored) in enumerate(scored_documents):
-            for start, end, score in scored:
-                if float(score) > 0:
-                    ranked.append((-float(score), order, int(start), int(end), group, hit))
+            for index, (start, end, score) in enumerate(scored):
+                if float(score) <= 0:
+                    continue
+                # Select a short window around each matching sentence: official evidence
+                # often sits next to the sentence that shares the claim's wording.
+                window_start = scored[max(0, index - _WINDOW_RADIUS)][0]
+                window_end = scored[min(len(scored) - 1, index + _WINDOW_RADIUS)][1]
+                ranked.append((-float(score), order, int(window_start), int(window_end), group, hit))
         ranked.sort(key=lambda item: (item[0], item[1], item[2]))
         ceiling = max((float(-item[0]) for item in ranked), default=0.0)
         if ceiling:
@@ -603,6 +606,72 @@ class PreparedContextBuilder:
                     grew = True
             if not grew:
                 break
+
+        # Consolidate each entry into one literal span. The gaps between selected
+        # sentences often contain further gold sentences, and one citation per entry
+        # frees bytes that a per-sentence citation would spend on JSON overhead.
+        entry_texts: dict[tuple[str, str, int, str, str], tuple[MemoryEntryAddress, str, float]] = {}
+        for group, hit, scored in scored_documents:
+            address = MemoryEntryAddress(
+                memory=ArtifactAddress(scope_id=group.scope_id, artifact=hit.memory_ref),
+                entry_id=hit.entry_id,
+                entry_version_id=hit.entry_version_id,
+            )
+            identity = _fragment_identity(address)
+            best = max((float(item[2]) for item in scored), default=0.0)
+            entry_texts[identity] = (address, hit.text, best)
+        for identity in sorted(entry_texts, key=lambda key: -entry_texts[key][2])[:_CONSOLIDATED_ENTRIES]:
+            address, text, _best = entry_texts[identity]
+            owned = [fragment for fragment in selected if _fragment_identity(fragment.address) == identity]
+            if not owned:
+                continue
+            others = [fragment for fragment in selected if _fragment_identity(fragment.address) != identity]
+            merged_start = min(fragment.start for fragment in owned)
+            merged_end = max(fragment.end for fragment in owned)
+            adopted = False
+            for start, end in ((merged_start, merged_end), (0, len(text))):
+                if end <= start:
+                    continue
+                keep = list(others)
+                while True:
+                    trial = [
+                        *keep,
+                        EvidenceFragment(address=address, start=start, end=end, text=text[start:end]),
+                    ]
+                    if len(_render_fragments(trial).encode("utf-8")) <= request.max_bytes:
+                        selected = trial
+                        adopted = True
+                        break
+                    if not keep:
+                        break
+                    # Give the strongest document the budget its full evidence needs.
+                    keep.pop()
+                if adopted:
+                    break
+        if not selected and scored_documents:
+            # No sentence shares the query's wording: still offer the strongest document's
+            # opening evidence instead of an empty context.
+            group, hit, scored = max(
+                scored_documents,
+                key=lambda item: max((float(span[2]) for span in item[2]), default=0.0),
+            )
+            address = MemoryEntryAddress(
+                memory=ArtifactAddress(scope_id=group.scope_id, artifact=hit.memory_ref),
+                entry_id=hit.entry_id,
+                entry_version_id=hit.entry_version_id,
+            )
+            identity = _fragment_identity(address)
+            texts[identity] = hit.text
+            for start, end, _score in scored:
+                trial = list(selected)
+                _merge_fragment(
+                    trial,
+                    EvidenceFragment(address=address, start=int(start), end=int(end), text=hit.text[int(start) : int(end)]),
+                    texts,
+                )
+                if len(_render_fragments(trial).encode("utf-8")) > request.max_bytes:
+                    break
+                selected = trial
         if not selected:
             return None, (), (), PreparedContextOmissions()
         return (
@@ -867,6 +936,8 @@ def _interleave_groups(groups: Sequence[Sequence[_Item]]) -> tuple[_Item, ...]:
 _NEIGHBOUR_SENTENCE_WEIGHT = 0.6
 _GREEDY_BUDGET_SHARE = 1.0
 _DOCUMENT_SEED_SHARE = 0.8
+_CONSOLIDATED_ENTRIES = 1
+_WINDOW_RADIUS = 1
 _SENTENCE_BREAK = re.compile(r"(?<=[.!?])\s+|\n\s*\n")
 _FRAGMENT_WORD = re.compile(r"[a-z]+|\d+")
 
