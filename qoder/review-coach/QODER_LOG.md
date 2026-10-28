@@ -35,6 +35,15 @@ $ python -m coach export alice
 }
 ```
 
+## 截图
+
+| 截图 | 内容 |
+| --- | --- |
+| ![职责拆分](screenshots/01-requirements.png) | 22:04 桌面端：职责划分与功能清单 |
+| ![export 验证](screenshots/02-export.png) | 22:05 桌面端：确认 export 命令与用法 |
+| ![发布站点](screenshots/03-sites-publish.png) | 22:10 桌面端：Qoder Sites 发布过程 |
+| ![站点网址](screenshots/04-site-url.png) | 22:16 桌面端：发布成功、可见范围已设为公开 |
+
 ## 说明
 
 - 会话 1 由 Qoder CLI 执行，命令为：
