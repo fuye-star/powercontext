@@ -1,5 +1,5 @@
 app:
-  description: 和高德无关的 Dify 作品：一家会记住你的小旅馆。用 PowerContext 存取跨会话记忆，Dify 负责编排与角色扮演。
+  description: 巷子深处的记忆旅馆：老板娘会记住你说过的每一句话。Dify Chatflow 负责编排与角色扮演，PowerContext 负责跨会话记忆的存储与检索。
   icon: 🏮
   icon_background: '#FFEAD5'
   mode: advanced-chat
