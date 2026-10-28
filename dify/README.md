@@ -123,6 +123,17 @@ python scripts/verify_memory.py --base-url http://127.0.0.1:8123
 
 预期最后一行：`PASS: scope + remember + search round trip matches the Dify workflow.`
 
+## 7.1 提交前自检（无需 Dify 实例）
+
+```bash
+# 1) 检查 DSL 结构、节点连线、环境变量、两个代码节点构造的字段
+python scripts/validate_dsl.py
+# 预期：OK nodes=7 edges=6 env=['PC_BASE_URL', 'PC_SCOPE_ID'] dsl_version=0.1.5
+
+# 2) 对照 PowerContext OpenAPI 核对两个 HTTP 节点的请求体
+#    见 samples/api-contract.md（含可直接执行的 curl 命令）
+```
+
 ## 8. 恢复初始状态
 
 记忆全部在 PowerContext 的 Scope 里，和 Dify 会话无关：
@@ -146,6 +157,8 @@ python scripts/verify_memory.py --base-url http://127.0.0.1:8123
 | `memory-inn.dsl.yml` | Dify Chatflow DSL（7 个节点），导入即可用 |
 | `scripts/init_scope.py` | 创建/复用记忆 Scope，输出 Dify 环境变量值；`--seed` 写入一条开张记忆 |
 | `scripts/verify_memory.py` | 复现 Dify 两个 HTTP 节点的调用，验证 scope → remember → search 闭环 |
+| `scripts/validate_dsl.py` | 不依赖 Dify 的 DSL 静态检查：结构、连线、环境变量、HTTP 请求字段 |
+| `samples/api-contract.md` | 两个 HTTP 节点与 PowerContext OpenAPI 的字段对照及 curl 验证命令 |
 | `docker-compose.powercontext.yml` | 把 PowerContext Server 作为 Dify 同网络服务运行 |
 | `Dockerfile.powercontext` | 上述服务的镜像构建文件 |
 | `samples/verification.md` | 验证样例：步骤、预期、实际运行日志 |
