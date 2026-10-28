@@ -297,7 +297,9 @@ async def _rank_captured_pages(
     if reference is None:
         return ()
 
-    key = (reference.family, reference.artifact_id, reference.revision)
+    # Different Scopes can reuse the same Memory artifact id and revision, so the
+    # cache key must carry the Scope identity as well.
+    key = (str(getattr(memory, "scope_id", "")), reference.family, reference.artifact_id, reference.revision)
     index = _INDEX_CACHE.get(key)
     if index is None:
         try:
@@ -460,6 +462,9 @@ def _index_scores(index: _PageIndex, terms: tuple[str, ...]) -> list[float]:
             if window_score > best_window:
                 best_window = window_score
         combined = score + _WINDOW_WEIGHT * best_window
+        if terms:
+            present = sum(1 for term in terms if frequencies.get(term))
+            combined *= 1 + _COVERAGE_WEIGHT * (present / len(terms))
 
         title = index.titles[position]
         boost = 0.0
@@ -480,6 +485,11 @@ def _index_scores(index: _PageIndex, terms: tuple[str, ...]) -> list[float]:
             if term_set & keywords and name in title:
                 boost = _SECTION_BOOST
         scores.append(combined * (1 + boost))
+    if term_set & _STATEMENT_TERMS and scores:
+        ceiling = max(scores)
+        for position in range(count):
+            if any(fragment in index.titles[position] for fragment in _STATEMENT_TITLES):
+                scores[position] += _STATEMENT_BONUS * ceiling
     return scores
 
 
@@ -493,13 +503,45 @@ def _question_terms(question: str) -> tuple[str, ...]:
         if token not in seen:
             seen.add(token)
             ordered.append(token)
+    for token in tuple(ordered):
+        for synonym in _QUERY_SYNONYMS.get(token, ()):
+            if synonym not in seen:
+                seen.add(synonym)
+                ordered.append(synonym)
     return tuple(ordered)
 
 
 _WORD = re.compile(r"[a-z0-9]+")
 _BM25_K1 = 0.9
 _BM25_B = 0.75
+_QUERY_SYNONYMS = {
+    "liquidity": ("liquid", "quick", "ratio", "working", "capital"),
+    "liquid": ("liquidity", "quick", "ratio"),
+    "margin": ("margins", "profitability", "gross", "operating"),
+    "margins": ("margin", "profitability", "gross", "operating"),
+    "tax": ("taxes", "effective", "rate"),
+    "taxes": ("tax", "effective", "rate"),
+    "customer": ("customers", "client", "clients", "consumers"),
+    "customers": ("customer", "client", "clients", "consumers"),
+    "geographies": ("geographic", "geography", "region", "regions", "international", "domestic"),
+    "geography": ("geographic", "region", "regions", "international", "domestic"),
+    "cyclicality": ("cyclical", "seasonal", "seasonality", "economic", "conditions"),
+    "cyclical": ("cyclicality", "seasonal", "economic"),
+    "legal": ("litigation", "proceedings", "contingencies", "claims", "lawsuits"),
+    "battles": ("litigation", "proceedings", "contingencies", "claims"),
+    "categories": ("category", "segment", "segments", "products", "services"),
+    "category": ("categories", "segment", "segments", "products"),
+    "retain": ("retention", "retained", "retaining", "churn"),
+    "retained": ("retain", "retention", "retaining"),
+    "debt": ("borrowings", "obligations", "notes", "credit"),
+    "revenue": ("revenues", "sales", "net"),
+    "revenues": ("revenue", "sales", "net"),
+    "expense": ("expenses", "cost", "costs"),
+    "expenses": ("expense", "cost", "costs"),
+}
+
 _NEIGHBOUR_WEIGHTS = ((1, 1.2), (2, 0.6))
+_COVERAGE_WEIGHT = 3.0
 _WINDOW_WEIGHT = 2.0
 _SECTION_BOOST = 2.0
 
@@ -568,6 +610,24 @@ _CASH_FLOW_TERMS = frozenset(
         "repurchase",
     }
 )
+_STATEMENT_TERMS = frozenset(
+    set(_INCOME_TERMS)
+    | set(_BALANCE_SHEET_TERMS)
+    | set(_CASH_FLOW_TERMS)
+    | {"effective", "gross", "margin", "margins", "net", "profitability", "ratio"}
+)
+_STATEMENT_TITLES = (
+    "STATEMENTS OF INCOME",
+    "STATEMENTS OF OPERATIONS",
+    "STATEMENT OF INCOME",
+    "STATEMENTS OF FINANCIAL POSITION",
+    "CONSOLIDATED BALANCE SHEET",
+    "BALANCE SHEETS",
+    "STATEMENTS OF CASH FLOWS",
+    "STATEMENT OF CASH FLOWS",
+    "SUMMARY OF FINANCIAL PERFORMANCE",
+)
+_STATEMENT_BONUS = 0.8
 _SECTION_TERMS: dict[str, frozenset[str]] = {
     "LEGAL PROCEEDINGS": frozenset({"battles", "lawsuit", "lawsuits", "legal", "litigation", "proceedings"}),
     "GEOGRAPHIC": frozenset({"countries", "geographic", "geographies", "geography", "regions"}),
