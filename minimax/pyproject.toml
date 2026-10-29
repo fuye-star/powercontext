@@ -1,0 +1,19 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "sdd-context"
+version = "0.1.0"
+description = "Spec-driven development context module for the MiniMax x OceanBase entry"
+requires-python = ">=3.11"
+dependencies = [
+    "powercontext[builtin]",
+    "pymysql>=1.1",
+]
+
+[project.scripts]
+sdd-context = "sdd_ctx.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["sdd_ctx"]

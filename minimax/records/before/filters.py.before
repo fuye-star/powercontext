@@ -1,0 +1,22 @@
+"""Expense filtering helpers for the SDD demo project."""
+
+from __future__ import annotations
+
+from collections.abc import Iterable, Mapping
+
+
+def filter_expenses(
+    rows: Iterable[Mapping[str, object]],
+    *,
+    category: str | None = None,
+) -> list[dict[str, object]]:
+    """Return expense rows filtered by category (case-insensitive)."""
+
+    filtered: list[dict[str, object]] = []
+    for row in rows:
+        if category is not None:
+            value = str(row.get("category", ""))
+            if value.casefold() != category.casefold():
+                continue
+        filtered.append(dict(row))
+    return filtered
